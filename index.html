@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lean Tracker</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#999; --accent:#4cc9f0; --warn:#f8961e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  header { padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  h1 { font-size:17px; margin:0 12px 0 0; }
+  button, select, label.file { background:#222; color:var(--fg); border:1px solid #444; border-radius:6px;
+    padding:8px 12px; font:inherit; cursor:pointer; }
+  button.rec { border-color:#c33; }
+  button.rec.on { background:#c33; }
+  #stage { position:relative; width:100%; max-width:960px; margin:0 auto; }
+  video, canvas { width:100%; display:block; }
+  canvas { position:absolute; inset:0; }
+  #readout { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px;
+    padding:10px 16px; max-width:960px; margin:0 auto; }
+  .card { background:#1b1b1b; border-radius:8px; padding:8px 12px; }
+  .card .k { color:var(--muted); font-size:12px; }
+  .card .v { font-size:26px; font-variant-numeric:tabular-nums; }
+  #status { color:var(--muted); padding:0 16px; max-width:960px; margin:0 auto; }
+  input[type=file] { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Lean Tracker</h1>
+  <button id="startCam">Start camera</button>
+  <select id="facing">
+    <option value="environment">Rear camera</option>
+    <option value="user">Front camera</option>
+  </select>
+  <label class="file">Open video…<input type="file" id="fileIn" accept="video/*"></label>
+  <button id="zero">Zero (calibrate)</button>
+  <button id="rec" class="rec">● Record</button>
+  <button id="csv">Download CSV</button>
+</header>
+<div id="status">Loading model…</div>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="readout">
+  <div class="card"><div class="k">Lateral lean (image plane) °</div><div class="v" id="lat">–</div></div>
+  <div class="card"><div class="k">Fwd/back lean (3D est.) °</div><div class="v" id="sag">–</div></div>
+  <div class="card"><div class="k">Shoulder tilt °</div><div class="v" id="sh">–</div></div>
+  <div class="card"><div class="k">Visibility</div><div class="v" id="vis">–</div></div>
+  <div class="card"><div class="k">FPS</div><div class="v" id="fps">–</div></div>
+  <div class="card"><div class="k">Samples recorded</div><div class="v" id="n">0</div></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+// "lite" is fastest on phones; swap to pose_landmarker_full / _heavy for more accuracy.
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+// Landmark indices (BlazePose 33-point topology)
+const L_SH = 11, R_SH = 12, L_HIP = 23, R_HIP = 24;
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const status = msg => $("status").textContent = msg;
+
+let landmarker, draw, running = false, lastVideoTime = -1;
+let offset = { lat: 0, sag: 0, sh: 0 };
+let latest = null, smooth = null;
+let recording = false, rows = [];
+let fpsT = performance.now(), fpsN = 0;
+const ALPHA = 0.3; // EMA smoothing factor (1 = no smoothing)
+
+const deg = r => r * 180 / Math.PI;
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 });
+
+async function init() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: "VIDEO", numPoses: 1 });
+  try { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
+  draw = new DrawingUtils(ctx);
+  status("Model ready. Start the camera or open a video.");
+}
+
+/** Compute lean angles from one pose result. Positive lateral = trunk tilts toward image-right. */
+function computeAngles(lm, wl, w, h) {
+  // 2D, in pixel units so aspect ratio doesn't distort the angle
+  const P = p => ({ x: p.x * w, y: p.y * h });
+  const sh = P(mid(lm[L_SH], lm[R_SH])), hip = P(mid(lm[L_HIP], lm[R_HIP]));
+  const lat = deg(Math.atan2(sh.x - hip.x, hip.y - sh.y)); // 0 = upright in the image
+
+  const ls = P(lm[L_SH]), rs = P(lm[R_SH]);
+  const shTilt = deg(Math.atan2(ls.y - rs.y, ls.x - rs.x));
+
+  // 3D world landmarks (meters, hip-centred, y down, z toward camera is negative).
+  // Depth is estimated from a single camera, so treat this as rough.
+  const wsh = mid(wl[L_SH], wl[R_SH]), whip = mid(wl[L_HIP], wl[R_HIP]);
+  const sag = deg(Math.atan2(-(wsh.z - whip.z), whip.y - wsh.y)); // + = toward camera
+
+  const vis = Math.min(lm[L_SH].visibility, lm[R_SH].visibility, lm[L_HIP].visibility, lm[R_HIP].visibility);
+  return { lat, sag, sh: shTilt, vis };
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
+    const res = landmarker.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (res.landmarks.length) {
+      const lm = res.landmarks[0];
+      draw.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#4cc9f0", lineWidth: 3 });
+      draw.drawLandmarks(lm, { color: "#f8961e", radius: 3 });
+      const a = computeAngles(lm, res.worldLandmarks[0], canvas.width, canvas.height);
+      smooth = smooth
+        ? { lat: smooth.lat + ALPHA * (a.lat - smooth.lat), sag: smooth.sag + ALPHA * (a.sag - smooth.sag),
+            sh: smooth.sh + ALPHA * (a.sh - smooth.sh), vis: a.vis }
+        : a;
+      latest = a;
+      show(smooth);
+      if (recording) {
+        rows.push([ (performance.now()/1000).toFixed(3), video.currentTime.toFixed(3),
+          (a.lat - offset.lat).toFixed(2), (a.sag - offset.sag).toFixed(2),
+          (a.sh - offset.sh).toFixed(2), a.vis.toFixed(3) ]);
+        $("n").textContent = rows.length;
+      }
+    }
+    fpsN++;
+    const now = performance.now();
+    if (now - fpsT > 1000) { $("fps").textContent = (fpsN * 1000 / (now - fpsT)).toFixed(0); fpsT = now; fpsN = 0; }
+  }
+  requestAnimationFrame(loop);
+}
+
+function show(s) {
+  $("lat").textContent = (s.lat - offset.lat).toFixed(1);
+  $("sag").textContent = (s.sag - offset.sag).toFixed(1);
+  $("sh").textContent  = (s.sh - offset.sh).toFixed(1);
+  $("vis").textContent = s.vis.toFixed(2);
+  $("vis").style.color = s.vis < 0.5 ? "var(--warn)" : "";
+}
+
+function start() { running = true; lastVideoTime = -1; smooth = null; requestAnimationFrame(loop); }
+
+$("startCam").onclick = async () => {
+  if (!landmarker) return;
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: $("facing").value, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  } catch (e) { status("Camera error: " + e.message + " (camera needs https or localhost)"); return; }
+  video.removeAttribute("src");
+  await video.play();
+  status("Running on camera.");
+  start();
+};
+
+$("fileIn").onchange = async e => {
+  const f = e.target.files[0]; if (!f || !landmarker) return;
+  if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+  video.src = URL.createObjectURL(f);
+  video.controls = true;
+  await video.play();
+  status("Running on " + f.name);
+  start();
+};
+
+$("zero").onclick = () => {
+  if (!smooth) return;
+  offset = { lat: smooth.lat, sag: smooth.sag, sh: smooth.sh };
+  status("Zeroed: current posture = 0°.");
+};
+
+$("rec").onclick = () => {
+  recording = !recording;
+  $("rec").classList.toggle("on", recording);
+  $("rec").textContent = recording ? "■ Stop" : "● Record";
+};
+
+$("csv").onclick = () => {
+  const header = "t_wall_s,t_video_s,lateral_deg,fwd_back_deg,shoulder_tilt_deg,min_visibility\n";
+  const blob = new Blob([header + rows.map(r => r.join(",")).join("\n")], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `lean_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  a.click();
+};
+
+init().catch(e => status("Failed to load MediaPipe: " + e.message));
+</script>
+</body>
+</html>
